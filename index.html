@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
-<title>3D Город</title>
+<title>3D Город — Большой</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body { height: 100%; overflow: hidden; background: #000; font-family: Arial, sans-serif; touch-action: none; user-select: none; -webkit-user-select: none; }
@@ -20,15 +20,22 @@
 const IS_TOUCH = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
 const IS_MOBILE = IS_TOUCH && Math.min(innerWidth, innerHeight) < 900;
 
+// РАЗМЕР МИРА — 120×120 метров (было 60×60)
+const WORLD_HALF = 60;
+
 let scene, camera, renderer;
 let carGroup, wheels = [];
 let keys = {};
 let state = 'splash';
 let splashStart = 0;
-let gameStartTime = 0;
 let gameTime = 0;
 let maxSpeedReached = 0;
 let distanceDriven = 0;
+let shakeAmount = 0;
+
+// Все препятствия для коллизий
+let obstacles = []; // { x, z, w, d } — прямоугольники
+let pickupItems = []; // { x, z, type, mesh, alive }
 
 let records = { topScores: [], bestSpeed: 0, bestTime: 0, bestDistance: 0 };
 try { const r = localStorage.getItem('carGameRecords'); if (r) records = Object.assign(records, JSON.parse(r)); } catch(e){}
@@ -38,6 +45,9 @@ let settings = { sound: true, music: true, graphics: 'high', sensitivity: 1.0 };
 try { const s = localStorage.getItem('carGameSettings'); if (s) settings = Object.assign(settings, JSON.parse(s)); } catch(e){}
 function saveSettings() { try { localStorage.setItem('carGameSettings', JSON.stringify(settings)); } catch(e){} }
 
+// ============================================
+//   ТЕКСТУРЫ
+// ============================================
 function makeTex(w, h, drawFn) {
   const c = document.createElement('canvas');
   c.width = w; c.height = h;
@@ -56,7 +66,7 @@ const grassTex = makeTex(128, 128, (g, w, h) => {
     g.fillRect(Math.random()*w, Math.random()*h, 1.5, 3);
   }
 });
-grassTex.repeat.set(25, 25);
+grassTex.repeat.set(50, 50);
 
 const asphaltTex = makeTex(128, 128, (g, w, h) => {
   g.fillStyle = '#3a3a3a'; g.fillRect(0, 0, w, h);
@@ -98,12 +108,15 @@ const woodTex = makeTex(64, 128, (g, w, h) => {
   }
 });
 
+// ============================================
+//   ИНИЦИАЛИЗАЦИЯ
+// ============================================
 function init3D() {
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x87ceeb);
-  scene.fog = new THREE.Fog(0x87ceeb, 55, 150);
+  scene.fog = new THREE.Fog(0x87ceeb, 80, 200);
 
-  camera = new THREE.PerspectiveCamera(65, innerWidth/innerHeight, 0.1, 500);
+  camera = new THREE.PerspectiveCamera(65, innerWidth/innerHeight, 0.1, 800);
   camera.position.set(0, 5.5, -9);
 
   renderer = new THREE.WebGLRenderer({ antialias: !IS_MOBILE });
@@ -119,16 +132,16 @@ function init3D() {
   sun.castShadow = !IS_MOBILE && settings.graphics === 'high';
   if (sun.castShadow) {
     sun.shadow.mapSize.set(2048, 2048);
-    Object.assign(sun.shadow.camera, { left: -45, right: 45, top: 45, bottom: -45, near: 1, far: 160 });
+    Object.assign(sun.shadow.camera, { left: -80, right: 80, top: 80, bottom: -80, near: 1, far: 250 });
   }
   scene.add(sun);
   scene.add(new THREE.HemisphereLight(0x87ceeb, 0x4a7c3a, 0.35));
 
-  const sunMesh = new THREE.Mesh(new THREE.SphereGeometry(3, 16, 16), new THREE.MeshBasicMaterial({ color: 0xffffcc }));
-  sunMesh.position.set(80, 100, 60);
+  const sunMesh = new THREE.Mesh(new THREE.SphereGeometry(4, 16, 16), new THREE.MeshBasicMaterial({ color: 0xffffcc }));
+  sunMesh.position.set(120, 150, 80);
   scene.add(sunMesh);
 
-  for (let i = 0; i < 10; i++) {
+  for (let i = 0; i < 15; i++) {
     const cloud = new THREE.Group();
     for (let j = 0; j < 4; j++) {
       const puff = new THREE.Mesh(
@@ -138,7 +151,7 @@ function init3D() {
       puff.position.set(j*2-3 + Math.random()*2, Math.random()*1, Math.random()*2-1);
       cloud.add(puff);
     }
-    cloud.position.set(-100 + Math.random()*200, 35 + Math.random()*15, -100 + Math.random()*200);
+    cloud.position.set(-150 + Math.random()*300, 40 + Math.random()*20, -150 + Math.random()*300);
     scene.add(cloud);
   }
 
@@ -149,170 +162,218 @@ function init3D() {
   createParkedCars();
   createTreesAndBridges();
   createStreetLamps();
+  createPickups();
   createCar();
 
   addEventListener('resize', onResize);
   onResize();
 }
 
+// ============================================
+//   ЗЕМЛЯ + СТЕНЫ
+// ============================================
 function createGround() {
   const grassMat = new THREE.MeshLambertMaterial({ map: grassTex });
-  const grass = new THREE.Mesh(new THREE.PlaneGeometry(220, 220), grassMat);
+  const grass = new THREE.Mesh(new THREE.PlaneGeometry(WORLD_HALF*2 + 20, WORLD_HALF*2 + 20), grassMat);
   grass.rotation.x = -Math.PI / 2;
   grass.receiveShadow = !IS_MOBILE;
   scene.add(grass);
 
+  // Стены по краю
   const wallMat = new THREE.MeshLambertMaterial({ color: 0x666666 });
-  for (const [x,y,z,w,h,d] of [
-    [0, 0.6, -30, 60, 1.2, 0.5], [0, 0.6, 30, 60, 1.2, 0.5],
-    [-30, 0.6, 0, 0.5, 1.2, 60], [30, 0.6, 0, 0.5, 1.2, 60],
-  ]) {
+  const W = WORLD_HALF;
+  const walls = [
+    [0, 0.6, -W, W*2, 1.2, 0.5],
+    [0, 0.6, W, W*2, 1.2, 0.5],
+    [-W, 0.6, 0, 0.5, 1.2, W*2],
+    [W, 0.6, 0, 0.5, 1.2, W*2],
+  ];
+  for (const [x,y,z,w,h,d] of walls) {
     const wall = new THREE.Mesh(new THREE.BoxGeometry(w,h,d), wallMat);
     wall.position.set(x,y,z);
     wall.castShadow = !IS_MOBILE;
     wall.receiveShadow = !IS_MOBILE;
     scene.add(wall);
+    obstacles.push({ x, z, w: w, d: d });
   }
 }
 
+// ============================================
+//   ДОРОГИ (сетка)
+// ============================================
 function createRoads() {
   const roadMat = new THREE.MeshLambertMaterial({ map: asphaltTex });
+  const roadWidth = 8;
+  const W = WORLD_HALF;
 
-  const roadX = new THREE.Mesh(new THREE.PlaneGeometry(60, 7), roadMat.clone());
-  roadX.material.map = asphaltTex.clone();
-  roadX.material.map.repeat.set(15, 1.5);
-  roadX.rotation.x = -Math.PI / 2; roadX.position.y = 0.01;
-  roadX.receiveShadow = !IS_MOBILE;
-  scene.add(roadX);
+  // Горизонтальные дороги: z = -30, 0, 30
+  for (const z of [-30, 0, 30]) {
+    const road = new THREE.Mesh(new THREE.PlaneGeometry(W*2, roadWidth), roadMat.clone());
+    road.material.map = asphaltTex.clone();
+    road.material.map.repeat.set(W*2/4, 2);
+    road.rotation.x = -Math.PI / 2;
+    road.position.set(0, 0.01, z);
+    road.receiveShadow = !IS_MOBILE;
+    scene.add(road);
+  }
 
-  const roadZ = new THREE.Mesh(new THREE.PlaneGeometry(7, 60), roadMat.clone());
-  roadZ.material.map = asphaltTex.clone();
-  roadZ.material.map.repeat.set(1.5, 15);
-  roadZ.rotation.x = -Math.PI / 2; roadZ.position.y = 0.01;
-  roadZ.receiveShadow = !IS_MOBILE;
-  scene.add(roadZ);
+  // Вертикальные дороги: x = -30, 0, 30
+  for (const x of [-30, 0, 30]) {
+    const road = new THREE.Mesh(new THREE.PlaneGeometry(roadWidth, W*2), roadMat.clone());
+    road.material.map = asphaltTex.clone();
+    road.material.map.repeat.set(2, W*2/4);
+    road.rotation.x = -Math.PI / 2;
+    road.position.set(x, 0.01, 0);
+    road.receiveShadow = !IS_MOBILE;
+    scene.add(road);
+  }
 
-  const roadGas = new THREE.Mesh(new THREE.PlaneGeometry(3.5, 15), roadMat.clone());
-  roadGas.material.map = asphaltTex.clone();
-  roadGas.material.map.repeat.set(1, 4);
-  roadGas.rotation.x = -Math.PI / 2;
-  roadGas.position.set(-15, 0.01, 11);
-  roadGas.receiveShadow = !IS_MOBILE;
-  scene.add(roadGas);
-
+  // Разметка
   const lineMat = new THREE.MeshBasicMaterial({ color: 0xf1c40f });
-  for (let i = -28; i <= 28; i += 4) {
-    if (Math.abs(i) < 2) continue;
-    const lx = new THREE.Mesh(new THREE.PlaneGeometry(2, 0.2), lineMat);
-    lx.rotation.x = -Math.PI / 2; lx.position.set(i, 0.02, 0);
-    scene.add(lx);
-    const lz = new THREE.Mesh(new THREE.PlaneGeometry(0.2, 2), lineMat);
-    lz.rotation.x = -Math.PI / 2; lz.position.set(0, 0.02, i);
-    scene.add(lz);
+
+  for (const z of [-30, 0, 30]) {
+    for (let i = -W + 2; i <= W - 2; i += 4) {
+      if (Math.abs(i) < 5 || Math.abs(Math.abs(i) - 30) < 5) continue;
+      const line = new THREE.Mesh(new THREE.PlaneGeometry(2, 0.25), lineMat);
+      line.rotation.x = -Math.PI / 2;
+      line.position.set(i, 0.02, z);
+      scene.add(line);
+    }
   }
 
-  const curbMat = new THREE.MeshLambertMaterial({ color: 0xcccccc });
-  for (const z of [-3.5, 3.5]) {
-    const c = new THREE.Mesh(new THREE.BoxGeometry(60, 0.15, 0.3), curbMat);
-    c.position.set(0, 0.075, z); c.receiveShadow = !IS_MOBILE; scene.add(c);
+  for (const x of [-30, 0, 30]) {
+    for (let i = -W + 2; i <= W - 2; i += 4) {
+      if (Math.abs(i) < 5 || Math.abs(Math.abs(i) - 30) < 5) continue;
+      const line = new THREE.Mesh(new THREE.PlaneGeometry(0.25, 2), lineMat);
+      line.rotation.x = -Math.PI / 2;
+      line.position.set(x, 0.02, i);
+      scene.add(line);
+    }
   }
-  for (const x of [-3.5, 3.5]) {
-    const c = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.15, 60), curbMat);
-    c.position.set(x, 0.075, 0); c.receiveShadow = !IS_MOBILE; scene.add(c);
+
+  // Бордюры вдоль всех дорог
+  const curbMat = new THREE.MeshLambertMaterial({ color: 0xcccccc });
+  const roadHalf = roadWidth / 2 + 0.15;
+
+  for (const z of [-30, 0, 30]) {
+    for (const dz of [-roadHalf, roadHalf]) {
+      const c = new THREE.Mesh(new THREE.BoxGeometry(W*2, 0.15, 0.3), curbMat);
+      c.position.set(0, 0.075, z + dz);
+      c.receiveShadow = !IS_MOBILE;
+      scene.add(c);
+    }
+  }
+  for (const x of [-30, 0, 30]) {
+    for (const dx of [-roadHalf, roadHalf]) {
+      const c = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.15, W*2), curbMat);
+      c.position.set(x + dx, 0.075, 0);
+      c.receiveShadow = !IS_MOBILE;
+      scene.add(c);
+    }
   }
 }
 
+// ============================================
+//   ДОМА (много, по кварталам)
+// ============================================
 function createHouses() {
   const wallMat = new THREE.MeshLambertMaterial({ map: brickTex });
   const roofMat = new THREE.MeshLambertMaterial({ map: roofTex });
   const winMat = new THREE.MeshBasicMaterial({ color: 0x9ad0ff });
   const doorMat = new THREE.MeshLambertMaterial({ color: 0x5a3a1a });
 
-  const houses = [
-    { x: -22, z: -20, w: 5, h: 3.5, d: 5 }, { x: -22, z: -13, w: 4, h: 3, d: 4 },
-    { x: -22, z: -5, w: 5, h: 3.5, d: 4 }, { x: -22, z: 20, w: 5, h: 4, d: 5 },
-    { x: -22, z: 27, w: 4, h: 3, d: 4 },
-    { x: 22, z: -22, w: 6, h: 4, d: 5 }, { x: 22, z: -15, w: 4, h: 3, d: 4 },
-    { x: 22, z: -7, w: 5, h: 3.5, d: 4 }, { x: 22, z: 5, w: 5, h: 4, d: 5 },
-    { x: 22, z: 22, w: 6, h: 3.5, d: 5 }, { x: 22, z: 28, w: 4, h: 3, d: 4 },
-    { x: -15, z: -22, w: 4, h: 3, d: 4 }, { x: -8, z: -22, w: 5, h: 3.5, d: 4 },
-    { x: 8, z: -22, w: 4, h: 3, d: 4 }, { x: 15, z: -22, w: 5, h: 4, d: 5 },
-    { x: -15, z: 22, w: 5, h: 3.5, d: 4 }, { x: -8, z: 22, w: 4, h: 3, d: 4 },
-    { x: 8, z: 22, w: 5, h: 4, d: 5 }, { x: 15, z: 22, w: 4, h: 3, d: 4 },
-  ];
-
-  for (const h of houses) {
-    const g = new THREE.Group();
-    const body = new THREE.Mesh(new THREE.BoxGeometry(h.w, h.h, h.d), wallMat);
-    body.position.y = h.h / 2;
-    body.castShadow = !IS_MOBILE; body.receiveShadow = !IS_MOBILE;
-    g.add(body);
-
-    const winGeo = new THREE.PlaneGeometry(0.8, 0.8);
-    for (const s of [{oz: h.d/2+0.01, rot: 0}, {oz: -h.d/2-0.01, rot: Math.PI}, {ox: h.w/2+0.01, rot: Math.PI/2}, {ox: -h.w/2-0.01, rot: -Math.PI/2}]) {
-      for (let i = 0; i < 2; i++) {
-        const w = new THREE.Mesh(winGeo, winMat);
-        if (s.ox !== undefined) w.position.set(s.ox, h.h * 0.65, (i - 0.5) * h.d * 0.5);
-        else w.position.set((i - 0.5) * h.w * 0.5, h.h * 0.65, s.oz);
-        w.rotation.y = s.rot;
-        g.add(w);
-      }
+  // Кварталы между дорогами
+  const centers = [];
+  for (const x of [-45, -15, 15, 45]) {
+    for (const z of [-45, -15, 15, 45]) {
+      centers.push([x, z]);
     }
+  }
 
-    const door = new THREE.Mesh(new THREE.PlaneGeometry(0.9, 1.6), doorMat);
-    door.position.set(0, 0.8, h.d/2 + 0.01);
-    g.add(door);
+  for (const [cx, cz] of centers) {
+    // 2 дома на квартал
+    const houses = [
+      { x: cx - 3.5, z: cz - 3.5, w: 5, h: 3.5, d: 5 },
+      { x: cx + 3.5, z: cz + 3.5, w: 5, h: 3.5, d: 5 },
+    ];
 
-    const roof = new THREE.Mesh(new THREE.ConeGeometry(Math.max(h.w, h.d) * 0.85, 1.8, 4), roofMat);
-    roof.position.y = h.h + 0.9; roof.rotation.y = Math.PI / 4;
-    roof.castShadow = !IS_MOBILE;
-    g.add(roof);
+    for (const h of houses) {
+      const g = new THREE.Group();
+      const body = new THREE.Mesh(new THREE.BoxGeometry(h.w, h.h, h.d), wallMat);
+      body.position.y = h.h / 2;
+      body.castShadow = !IS_MOBILE; body.receiveShadow = !IS_MOBILE;
+      g.add(body);
 
-    g.position.set(h.x, 0, h.z);
-    scene.add(g);
+      const winGeo = new THREE.PlaneGeometry(0.8, 0.8);
+      for (const s of [{oz: h.d/2+0.01, rot: 0}, {oz: -h.d/2-0.01, rot: Math.PI}, {ox: h.w/2+0.01, rot: Math.PI/2}, {ox: -h.w/2-0.01, rot: -Math.PI/2}]) {
+        for (let i = 0; i < 2; i++) {
+          const w = new THREE.Mesh(winGeo, winMat);
+          if (s.ox !== undefined) w.position.set(s.ox, h.h * 0.65, (i - 0.5) * h.d * 0.5);
+          else w.position.set((i - 0.5) * h.w * 0.5, h.h * 0.65, s.oz);
+          w.rotation.y = s.rot;
+          g.add(w);
+        }
+      }
+
+      const door = new THREE.Mesh(new THREE.PlaneGeometry(0.9, 1.6), doorMat);
+      door.position.set(0, 0.8, h.d/2 + 0.01);
+      g.add(door);
+
+      const roof = new THREE.Mesh(new THREE.ConeGeometry(Math.max(h.w, h.d) * 0.85, 1.8, 4), roofMat);
+      roof.position.y = h.h + 0.9; roof.rotation.y = Math.PI / 4;
+      roof.castShadow = !IS_MOBILE;
+      g.add(roof);
+
+      g.position.set(h.x, 0, h.z);
+      scene.add(g);
+
+      // Коллизия — прямоугольник
+      obstacles.push({ x: h.x, z: h.z, w: h.w + 0.6, d: h.d + 0.6 });
+    }
   }
 }
 
+// ============================================
+//   ЗАПРАВКА
+// ============================================
 function createGasStation() {
   const station = new THREE.Group();
 
-  const floor = new THREE.Mesh(new THREE.BoxGeometry(12, 0.1, 10), new THREE.MeshLambertMaterial({ color: 0xaaaaaa }));
+  const floor = new THREE.Mesh(new THREE.BoxGeometry(14, 0.1, 12), new THREE.MeshLambertMaterial({ color: 0xaaaaaa }));
   floor.position.y = 0.05; floor.receiveShadow = !IS_MOBILE;
   station.add(floor);
 
-  const canopyTop = new THREE.Mesh(new THREE.BoxGeometry(10, 0.4, 6), new THREE.MeshLambertMaterial({ color: 0xdddddd }));
+  const canopyTop = new THREE.Mesh(new THREE.BoxGeometry(12, 0.4, 8), new THREE.MeshLambertMaterial({ color: 0xdddddd }));
   canopyTop.position.set(0, 4.5, 0); canopyTop.castShadow = !IS_MOBILE;
   station.add(canopyTop);
 
-  const stripe = new THREE.Mesh(new THREE.BoxGeometry(10.1, 0.5, 6.1), new THREE.MeshLambertMaterial({ color: 0xe63946 }));
+  const stripe = new THREE.Mesh(new THREE.BoxGeometry(12.1, 0.5, 8.1), new THREE.MeshLambertMaterial({ color: 0xe63946 }));
   stripe.position.set(0, 4.05, 0);
   station.add(stripe);
 
   const pillarMat = new THREE.MeshLambertMaterial({ color: 0xeeeeee });
   const pillarGeo = new THREE.CylinderGeometry(0.2, 0.2, 4.5, 8);
-  for (const [px, pz] of [[-4.5, -2.5], [4.5, -2.5], [-4.5, 2.5], [4.5, 2.5]]) {
+  for (const [px, pz] of [[-5.5, -3.5], [5.5, -3.5], [-5.5, 3.5], [5.5, 3.5]]) {
     const p = new THREE.Mesh(pillarGeo, pillarMat);
     p.position.set(px, 2.25, pz);
     p.castShadow = !IS_MOBILE;
     station.add(p);
   }
 
-  for (const pz of [-2, 2]) {
+  for (const pz of [-2.5, 2.5]) {
     const pump = new THREE.Group();
     const body = new THREE.Mesh(new THREE.BoxGeometry(0.8, 1.6, 0.6), new THREE.MeshLambertMaterial({ color: 0x333333 }));
     body.position.y = 0.8; body.castShadow = !IS_MOBILE;
     pump.add(body);
-
     const screen = new THREE.Mesh(new THREE.PlaneGeometry(0.5, 0.4), new THREE.MeshBasicMaterial({ color: 0x00ff88 }));
     screen.position.set(0, 1.2, 0.31);
     pump.add(screen);
-
     const top = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.15, 0.7), new THREE.MeshLambertMaterial({ color: 0xe63946 }));
     top.position.y = 1.7;
     pump.add(top);
-
     pump.position.set(0, 0, pz);
     station.add(pump);
+    obstacles.push({ x: 0, z: pz, w: 1.2, d: 1.0 });
   }
 
   const signTex = makeTex(256, 128, (g, w, h) => {
@@ -324,50 +385,60 @@ function createGasStation() {
     g.fillText('⛽', w/2, h/2 + 35);
   });
   const signFace = new THREE.Mesh(new THREE.PlaneGeometry(3, 1.5), new THREE.MeshBasicMaterial({ map: signTex }));
-  signFace.position.set(0, 6.8, -3.16);
+  signFace.position.set(0, 6.8, -4.16);
   signFace.rotation.y = Math.PI;
   station.add(signFace);
 
   const signBase = new THREE.Mesh(new THREE.BoxGeometry(3, 1, 0.3), new THREE.MeshLambertMaterial({ color: 0xe63946 }));
-  signBase.position.set(0, 6, -3);
+  signBase.position.set(0, 6, -4);
   station.add(signBase);
 
-  const signPole = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.15, 6, 8), new THREE.MeshLambertMaterial({ color: 0x888888 }));
-  signPole.position.set(0, 3, -3);
-  station.add(signPole);
-
   const shop = new THREE.Group();
-  const shopBody = new THREE.Mesh(new THREE.BoxGeometry(5, 2.8, 4), new THREE.MeshLambertMaterial({ map: brickTex }));
+  const shopBody = new THREE.Mesh(new THREE.BoxGeometry(6, 2.8, 4), new THREE.MeshLambertMaterial({ map: brickTex }));
   shopBody.position.y = 1.4; shopBody.castShadow = !IS_MOBILE; shopBody.receiveShadow = !IS_MOBILE;
   shop.add(shopBody);
-
-  const shopWin = new THREE.Mesh(new THREE.PlaneGeometry(3.5, 1.5), new THREE.MeshBasicMaterial({ color: 0x9ad0ff }));
+  const shopWin = new THREE.Mesh(new THREE.PlaneGeometry(4, 1.5), new THREE.MeshBasicMaterial({ color: 0x9ad0ff }));
   shopWin.position.set(0, 1.5, 2.01);
   shop.add(shopWin);
-
-  const shopRoof = new THREE.Mesh(new THREE.BoxGeometry(5.3, 0.3, 4.3), new THREE.MeshLambertMaterial({ color: 0x8b2f2f }));
+  const shopRoof = new THREE.Mesh(new THREE.BoxGeometry(6.3, 0.3, 4.3), new THREE.MeshLambertMaterial({ color: 0x8b2f2f }));
   shopRoof.position.y = 2.95; shopRoof.castShadow = !IS_MOBILE;
   shop.add(shopRoof);
-
-  shop.position.set(0, 0, -6);
+  shop.position.set(0, 0, -8);
   station.add(shop);
 
-  station.position.set(-15, 0, 11);
+  // Ставим заправку в одном из кварталов
+  station.position.set(-15, 0, 15);
   scene.add(station);
+
+  obstacles.push({ x: -15, z: 15 - 8, w: 6.5, d: 4.5 }); // магазин
 }
 
+// ============================================
+//   МАШИНЫ НА ПАРКОВКАХ
+// ============================================
 function createParkedCars() {
   const colors = [0x457b9d, 0x2a9d8f, 0xf77f00, 0x7209b7, 0x8d99ae, 0xe07a5f, 0xffd166, 0x06d6a0];
-  const spots = [
-    { x: 14, z: -3.5, angle: Math.PI / 2 }, { x: 16.5, z: -3.5, angle: Math.PI / 2 },
-    { x: 19, z: -3.5, angle: Math.PI / 2 }, { x: 21.5, z: -3.5, angle: Math.PI / 2 },
-    { x: 14, z: 3.5, angle: -Math.PI / 2 }, { x: 16.5, z: 3.5, angle: -Math.PI / 2 },
-    { x: 19, z: 3.5, angle: -Math.PI / 2 }, { x: 21.5, z: 3.5, angle: -Math.PI / 2 },
-    { x: 8, z: 15, angle: 0 }, { x: 11, z: 15, angle: 0 },
-    { x: -10, z: -15, angle: 0 }, { x: -13, z: -15, angle: 0 },
-  ];
-  for (let i = 0; i < spots.length; i++) {
-    createParkedCar(spots[i].x, spots[i].z, spots[i].angle, colors[i % colors.length]);
+  const spots = [];
+
+  // Парковки вдоль всех дорог
+  for (const z of [-30, 0, 30]) {
+    for (let x = -50; x <= 50; x += 5) {
+      if (Math.abs(x) < 6 || Math.abs(Math.abs(x) - 30) < 6) continue;
+      spots.push({ x, z: z - 5, angle: 0 });
+    }
+  }
+  for (const x of [-30, 0, 30]) {
+    for (let z = -50; z <= 50; z += 5) {
+      if (Math.abs(z) < 6 || Math.abs(Math.abs(z) - 30) < 6) continue;
+      spots.push({ x: x + 5, z, angle: Math.PI / 2 });
+    }
+  }
+
+  // Берём только часть
+  const shuffled = spots.sort(() => Math.random() - 0.5).slice(0, 40);
+
+  for (let i = 0; i < shuffled.length; i++) {
+    createParkedCar(shuffled[i].x, shuffled[i].z, shuffled[i].angle, colors[i % colors.length]);
   }
 }
 
@@ -396,6 +467,9 @@ function createParkedCar(x, z, angle, color) {
   g.position.set(x, 0, z);
   g.rotation.y = angle;
   scene.add(g);
+
+  // Коллизия — круг ~ 1.5м
+  obstacles.push({ x, z, w: 2, d: 3.6 });
 }
 
 function shadeColor(hex, amt) {
@@ -406,17 +480,26 @@ function shadeColor(hex, amt) {
   return (r<<16) | (g<<8) | b;
 }
 
+// ============================================
+//   ДЕРЕВЬЯ + ПЕРЕХОДЫ
+// ============================================
 function createTreesAndBridges() {
   const trunkMat = new THREE.MeshLambertMaterial({ map: woodTex });
   const leavesMat = new THREE.MeshLambertMaterial({ color: 0x2d7a1e });
 
-  for (let x = -28; x <= 28; x += 3.5) {
-    for (let z = -28; z <= 28; z += 3.5) {
-      if (Math.abs(x) < 6 || Math.abs(z) < 6) continue;
-      if (Math.abs(Math.abs(x) - 22) < 3) continue;
-      if (Math.abs(Math.abs(z) - 22) < 3) continue;
-      if (x < -8 && x > -25 && z > 5 && z < 18) continue;
-      if (Math.random() < 0.3) {
+  for (let x = -55; x <= 55; x += 4) {
+    for (let z = -55; z <= 55; z += 4) {
+      // Не на дорогах
+      if (Math.abs(x) < 5 || Math.abs(z) < 5) continue;
+      if (Math.abs(Math.abs(x) - 30) < 5) continue;
+      if (Math.abs(Math.abs(z) - 30) < 5) continue;
+      // Не на кварталах домов
+      if (Math.abs(Math.abs(x) - 45) < 6 && Math.abs(Math.abs(z) - 45) < 6) continue;
+      if (Math.abs(Math.abs(x) - 45) < 6 && Math.abs(Math.abs(z) - 15) < 6) continue;
+      if (Math.abs(Math.abs(x) - 15) < 6 && Math.abs(Math.abs(z) - 45) < 6) continue;
+      if (Math.abs(Math.abs(x) - 15) < 6 && Math.abs(Math.abs(z) - 15) < 6) continue;
+
+      if (Math.random() < 0.25) {
         const tree = new THREE.Group();
         const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.3, 1.8, 6), trunkMat);
         trunk.position.y = 0.9; trunk.castShadow = !IS_MOBILE;
@@ -430,41 +513,96 @@ function createTreesAndBridges() {
         tree.position.set(x + (Math.random()-0.5)*2, 0, z + (Math.random()-0.5)*2);
         tree.rotation.y = Math.random() * Math.PI * 2;
         scene.add(tree);
+
+        // Коллизия (круг 1м)
+        obstacles.push({ x: tree.position.x, z: tree.position.z, w: 1.2, d: 1.2 });
       }
     }
   }
 
+  // Переходы на перекрёстках
   const crosswalkMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-  for (let i = -3; i <= 3; i += 1) {
-    const stripe = new THREE.Mesh(new THREE.PlaneGeometry(0.5, 6.5), crosswalkMat);
-    stripe.rotation.x = -Math.PI / 2;
-    stripe.position.set(-10 + i * 0.9, 0.021, 0);
-    scene.add(stripe);
+  for (const cx of [-30, 0, 30]) {
+    for (const cz of [-30, 0, 30]) {
+      for (let i = -3; i <= 3; i += 1) {
+        const stripe = new THREE.Mesh(new THREE.PlaneGeometry(0.6, 7), crosswalkMat);
+        stripe.rotation.x = -Math.PI / 2;
+        stripe.position.set(cx + i * 1.1, 0.021, cz);
+        scene.add(stripe);
+      }
+    }
   }
 }
 
+// ============================================
+//   ФОНАРИ
+// ============================================
 function createStreetLamps() {
   const poleMat = new THREE.MeshLambertMaterial({ color: 0x333333 });
   const lampMat = new THREE.MeshBasicMaterial({ color: 0xffffcc });
-  const lampPos = [
-    [4.5, 5], [-4.5, 5], [4.5, -5], [-4.5, -5],
-    [4.5, 12], [-4.5, 12], [4.5, -12], [-4.5, -12],
-    [4.5, 18], [-4.5, 18], [4.5, -18], [-4.5, -18],
-    [12, 4.5], [18, 4.5], [24, 4.5],
-    [12, -4.5], [18, -4.5], [24, -4.5],
-    [-12, 4.5], [-18, 4.5], [-24, 4.5],
-    [-12, -4.5], [-18, -4.5], [-24, -4.5],
-  ];
-  for (const [x, z] of lampPos) {
-    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.1, 3.5, 6), poleMat);
-    pole.position.set(x, 1.75, z); pole.castShadow = !IS_MOBILE;
-    scene.add(pole);
-    const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.18, 8, 8), lampMat);
-    lamp.position.set(x, 3.6, z);
-    scene.add(lamp);
+
+  for (const z of [-30, 0, 30]) {
+    for (let x = -50; x <= 50; x += 12) {
+      if (Math.abs(x) < 5 || Math.abs(Math.abs(x) - 30) < 5) continue;
+      for (const dz of [-5.5, 5.5]) {
+        const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.1, 3.5, 6), poleMat);
+        pole.position.set(x, 1.75, z + dz); pole.castShadow = !IS_MOBILE;
+        scene.add(pole);
+        const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.18, 8, 8), lampMat);
+        lamp.position.set(x, 3.6, z + dz);
+        scene.add(lamp);
+        obstacles.push({ x, z: z + dz, w: 0.4, d: 0.4 });
+      }
+    }
+  }
+  for (const x of [-30, 0, 30]) {
+    for (let z = -50; z <= 50; z += 12) {
+      if (Math.abs(z) < 5 || Math.abs(Math.abs(z) - 30) < 5) continue;
+      for (const dx of [-5.5, 5.5]) {
+        const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.1, 3.5, 6), poleMat);
+        pole.position.set(x + dx, 1.75, z); pole.castShadow = !IS_MOBILE;
+        scene.add(pole);
+        const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.18, 8, 8), lampMat);
+        lamp.position.set(x + dx, 3.6, z);
+        scene.add(lamp);
+        obstacles.push({ x: x + dx, z, w: 0.4, d: 0.4 });
+      }
+    }
   }
 }
 
+// ============================================
+//   ЕДА-БОНУСЫ (монеты)
+// ============================================
+function createPickups() {
+  const positions = [];
+  for (let i = 0; i < 40; i++) {
+    let x, z, tries = 0;
+    do {
+      x = (Math.random() - 0.5) * 110;
+      z = (Math.random() - 0.5) * 110;
+      tries++;
+      // Не в препятствиях
+      let free = true;
+      for (const o of obstacles) {
+        if (Math.abs(x - o.x) < o.w/2 + 1 && Math.abs(z - o.z) < o.d/2 + 1) { free = false; break; }
+      }
+      if (free) break;
+    } while (tries < 30);
+
+    const geo = new THREE.CylinderGeometry(0.5, 0.5, 0.15, 12);
+    const mat = new THREE.MeshLambertMaterial({ color: 0xffd700, emissive: 0xffaa00 });
+    const coin = new THREE.Mesh(geo, mat);
+    coin.position.set(x, 1, z);
+    coin.rotation.x = Math.PI / 2;
+    scene.add(coin);
+    pickupItems.push({ x, z, type: 'coin', mesh: coin, alive: true, spin: Math.random() * Math.PI * 2 });
+  }
+}
+
+// ============================================
+//   МАШИНА ИГРОКА
+// ============================================
 function createCar() {
   carGroup = new THREE.Group();
   const bodyMat = new THREE.MeshLambertMaterial({ color: 0xe63946 });
@@ -499,13 +637,12 @@ function createCar() {
   const wheelGeo = new THREE.CylinderGeometry(0.4, 0.4, 0.3, 14);
   const wheelMat = new THREE.MeshLambertMaterial({ color: 0x111111 });
   const rimMat = new THREE.MeshLambertMaterial({ color: 0xaaaaaa });
-  const wheelPos = [
+  for (const wp of [
     { x: -0.9, y: 0.4, z: 1.2, isFront: true },
     { x: 0.9, y: 0.4, z: 1.2, isFront: true },
     { x: -0.9, y: 0.4, z: -1.2, isFront: false },
     { x: 0.9, y: 0.4, z: -1.2, isFront: false },
-  ];
-  for (const wp of wheelPos) {
+  ]) {
     const w = new THREE.Mesh(wheelGeo, wheelMat);
     w.rotation.z = Math.PI / 2;
     w.position.set(wp.x, wp.y, wp.z);
@@ -519,11 +656,15 @@ function createCar() {
   scene.add(carGroup);
 }
 
+// ============================================
+//   ФИЗИКА
+// ============================================
 const car = {
   x: 0, z: 0, angle: 0, speed: 0,
   maxSpeed: 22, maxReverse: -8,
   accel: 14, brake: 22, friction: 1.5,
   turnSpeed: 2.2,
+  radius: 1.5, // радиус коллизии машины
 };
 
 function resetCar() {
@@ -532,6 +673,13 @@ function resetCar() {
   carGroup.rotation.set(0, 0, 0);
   for (const m of skidMarks) scene.remove(m.mesh);
   skidMarks.length = 0;
+  // Восстанавливаем монеты
+  for (const p of pickupItems) {
+    if (!p.alive) {
+      p.alive = true;
+      p.mesh.visible = true;
+    }
+  }
 }
 
 const skidMarks = [];
@@ -551,6 +699,23 @@ function addSkidMark(x, z, angle) {
   }
 }
 
+// Проверка столкновения с препятствиями
+function checkCollision(newX, newZ) {
+  const r = car.radius;
+  for (const o of obstacles) {
+    // Прямоугольник + круг
+    const closestX = Math.max(o.x - o.w/2, Math.min(newX, o.x + o.w/2));
+    const closestZ = Math.max(o.z - o.d/2, Math.min(newZ, o.z + o.d/2));
+    const dx = newX - closestX;
+    const dz = newZ - closestZ;
+    if (dx*dx + dz*dz < r*r) return o;
+  }
+  return null;
+}
+
+// ============================================
+//   ЗВУК
+// ============================================
 let audioCtx = null, engineOsc = null, engineGain = null, engineLFO = null;
 let tireNoise = null, tireGain = null, soundStarted = false;
 
@@ -631,23 +796,47 @@ function honk() {
   const g = audioCtx.createGain();
   g.gain.setValueAtTime(0.15, audioCtx.currentTime);
   g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
-  osc.connect(g);
-  g.connect(audioCtx.destination);
+  osc.connect(g); g.connect(audioCtx.destination);
   osc.start(); osc.stop(audioCtx.currentTime + 0.35);
 }
 
 function clickSound() {
   if (!audioCtx || !settings.sound) return;
   const osc = audioCtx.createOscillator();
-  osc.type = 'square';
-  osc.frequency.value = 600;
+  osc.type = 'square'; osc.frequency.value = 600;
   const g = audioCtx.createGain();
   g.gain.setValueAtTime(0.08, audioCtx.currentTime);
   g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.06);
-  osc.connect(g);
-  g.connect(audioCtx.destination);
+  osc.connect(g); g.connect(audioCtx.destination);
   osc.start(); osc.stop(audioCtx.currentTime + 0.07);
 }
+
+function crashSound() {
+  if (!audioCtx || !settings.sound) return;
+  const osc = audioCtx.createOscillator();
+  osc.type = 'sawtooth'; osc.frequency.value = 80;
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0.2, audioCtx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
+  osc.connect(g); g.connect(audioCtx.destination);
+  osc.start(); osc.stop(audioCtx.currentTime + 0.3);
+}
+
+function coinSound() {
+  if (!audioCtx || !settings.sound) return;
+  const osc = audioCtx.createOscillator();
+  osc.type = 'square'; osc.frequency.value = 1000;
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0.1, audioCtx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.15);
+  osc.connect(g); g.connect(audioCtx.destination);
+  osc.start(); osc.stop(audioCtx.currentTime + 0.15);
+}
+
+// ============================================
+//   ДВИЖЕНИЕ
+// ============================================
+let brakePressed = false;
 
 function updateCar(dt) {
   let throttle = 0, steer = 0;
@@ -656,12 +845,19 @@ function updateCar(dt) {
   if (keys['a'] || keys['arrowleft'] || keys['ф']) steer += 1;
   if (keys['d'] || keys['arrowright'] || keys['в']) steer -= 1;
 
+  // Джойстик
   if (joystick.active) {
     throttle = -joystick.dy;
     steer = -joystick.dx;
     if (Math.abs(throttle) < 0.15) throttle = 0;
     if (Math.abs(steer) < 0.15) steer = 0;
   }
+
+  // Кнопки-стрелки
+  if (btnUp.pressed) throttle = 1;
+  if (btnDown.pressed) throttle = -1;
+  if (btnLeft.pressed) steer = 1;
+  if (btnRight.pressed) steer = -1;
 
   const speedAbs = Math.abs(car.speed);
 
@@ -685,10 +881,32 @@ function updateCar(dt) {
   }
 
   const oldX = car.x, oldZ = car.z;
-  car.x += Math.sin(car.angle) * car.speed * dt;
-  car.z += Math.cos(car.angle) * car.speed * dt;
-  car.x = Math.max(-28.5, Math.min(28.5, car.x));
-  car.z = Math.max(-28.5, Math.min(28.5, car.z));
+  const nextX = car.x + Math.sin(car.angle) * car.speed * dt;
+  const nextZ = car.z + Math.cos(car.angle) * car.speed * dt;
+
+  // Проверка коллизий
+  let collided = false;
+  const col = checkCollision(nextX, nextZ);
+  if (col) {
+    collided = true;
+    // Отскок
+    car.speed *= -0.3;
+    shakeAmount = 8;
+    crashSound();
+    // Толкаем от препятствия
+    const dx = car.x - col.x;
+    const dz = car.z - col.z;
+    const len = Math.hypot(dx, dz) || 1;
+    car.x += (dx / len) * 0.3;
+    car.z += (dz / len) * 0.3;
+  } else {
+    car.x = nextX;
+    car.z = nextZ;
+  }
+
+  // Границы мира
+  car.x = Math.max(-WORLD_HALF + 2, Math.min(WORLD_HALF - 2, car.x));
+  car.z = Math.max(-WORLD_HALF + 2, Math.min(WORLD_HALF - 2, car.z));
 
   distanceDriven += Math.hypot(car.x - oldX, car.z - oldZ);
   if (speedAbs > maxSpeedReached) maxSpeedReached = speedAbs;
@@ -713,6 +931,18 @@ function updateCar(dt) {
     addSkidMark(backX - sideX, backZ - sideZ, car.angle);
   }
 
+  // Монетки
+  for (const p of pickupItems) {
+    if (!p.alive) continue;
+    const d = Math.hypot(p.x - car.x, p.z - car.z);
+    if (d < car.radius + 0.7) {
+      p.alive = false;
+      p.mesh.visible = false;
+      coinSound();
+      shakeAmount = 2;
+    }
+  }
+
   for (let i = skidMarks.length - 1; i >= 0; i--) {
     skidMarks[i].life -= 1;
     skidMarks[i].mesh.material.opacity = Math.max(0, skidMarks[i].life / 400) * 0.55;
@@ -722,8 +952,19 @@ function updateCar(dt) {
     }
   }
 
+  // Крутим монетки
+  for (const p of pickupItems) {
+    if (p.alive) {
+      p.spin += dt * 3;
+      p.mesh.rotation.z = p.spin;
+    }
+  }
+
   updateEngineSound();
   updateTireSound(isDrifting);
+
+  if (shakeAmount > 0) shakeAmount *= 0.9;
+  if (shakeAmount < 0.3) shakeAmount = 0;
 
   const speedEl = document.getElementById('speed');
   if (speedEl) speedEl.innerHTML = Math.round(speedAbs * 3.6) + '<small>км/ч</small>';
@@ -732,7 +973,7 @@ function updateCar(dt) {
 function updateCamera() {
   const camOffset = { x: 0, y: 5.5, z: -9 };
   const cos = Math.cos(car.angle), sin = Math.sin(car.angle);
-  const tx = car.x + camOffset.x * cos + camOffset.z * sin;
+  const tx = car.x + camOffset.x * cos + camOffset.z * sin + (Math.random()-0.5) * shakeAmount * 0.1;
   const ty = camOffset.y;
   const tz = car.z - camOffset.x * sin + camOffset.z * cos;
   camera.position.x += (tx - camera.position.x) * 0.12;
@@ -743,6 +984,9 @@ function updateCamera() {
   camera.lookAt(lookX, 1.2, lookZ);
 }
 
+// ============================================
+//   КНОПКИ
+// ============================================
 let menuHover = null;
 let mouse = { x: 0, y: 0 };
 const allButtons = [];
@@ -752,9 +996,7 @@ function makeButton(id, text, x, y, w, h, color, onClick) {
   allButtons.push(b);
   return b;
 }
-
 function clearButtons() { allButtons.length = 0; }
-
 function getBtnAt(x, y) {
   for (let i = allButtons.length - 1; i >= 0; i--) {
     const b = allButtons[i];
@@ -767,33 +1009,29 @@ function getBtnAt(x, y) {
 function drawSplash() {
   const elapsed = (performance.now() - splashStart) / 1000;
   const grad = ctx.createLinearGradient(0, 0, 0, uiCanvas.height);
-  grad.addColorStop(0, '#1e3c72');
-  grad.addColorStop(1, '#2a5298');
+  grad.addColorStop(0, '#1e3c72'); grad.addColorStop(1, '#2a5298');
   ctx.fillStyle = grad;
   ctx.fillRect(0, 0, uiCanvas.width, uiCanvas.height);
 
   const scale = 0.5 + Math.min(1, elapsed / 1.5) * 0.5;
   const alpha = Math.min(1, elapsed / 1.2);
-
   ctx.save();
   ctx.globalAlpha = alpha;
   ctx.translate(uiCanvas.width/2, uiCanvas.height/2 - 40);
   ctx.scale(scale, scale);
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   ctx.font = 'bold 72px Arial';
   ctx.fillStyle = 'rgba(0,0,0,0.6)';
   ctx.fillText('3D ГОРОД', 4, 4);
   const gradT = ctx.createLinearGradient(-200, -50, 200, 50);
-  gradT.addColorStop(0, '#ffcc00');
-  gradT.addColorStop(1, '#e63946');
+  gradT.addColorStop(0, '#ffcc00'); gradT.addColorStop(1, '#e63946');
   ctx.fillStyle = gradT;
   ctx.fillText('3D ГОРОД', 0, 0);
   ctx.strokeStyle = '#000'; ctx.lineWidth = 3;
   ctx.strokeText('3D ГОРОД', 0, 0);
   ctx.font = 'bold 24px Arial';
   ctx.fillStyle = 'rgba(255,255,255,0.8)';
-  ctx.fillText('езди и наслаждайся', 0, 65);
+  ctx.fillText('большой город — 120×120 м', 0, 65);
   ctx.restore();
 
   const dots = '.'.repeat(Math.floor(elapsed * 2) % 4);
@@ -826,9 +1064,7 @@ function layoutMenu() {
 function drawMenu() {
   const w = uiCanvas.width, h = uiCanvas.height;
   const grad = ctx.createLinearGradient(0, 0, 0, h);
-  grad.addColorStop(0, '#1e3c72');
-  grad.addColorStop(0.6, '#2a5298');
-  grad.addColorStop(1, '#1a3a5a');
+  grad.addColorStop(0, '#1e3c72'); grad.addColorStop(0.6, '#2a5298'); grad.addColorStop(1, '#1a3a5a');
   ctx.fillStyle = grad;
   ctx.fillRect(0, 0, w, h);
 
@@ -837,34 +1073,26 @@ function drawMenu() {
   ctx.fillStyle = 'rgba(255,240,150,0.6)';
   ctx.beginPath(); ctx.arc(w*0.8, h*0.2, 55, 0, Math.PI*2); ctx.fill();
 
-  ctx.fillStyle = '#3d6b35';
-  ctx.fillRect(0, h*0.7, w, h*0.3);
-
-  ctx.fillStyle = '#2b2b2b';
-  ctx.fillRect(0, h*0.75, w, h*0.12);
-
+  ctx.fillStyle = '#3d6b35'; ctx.fillRect(0, h*0.7, w, h*0.3);
+  ctx.fillStyle = '#2b2b2b'; ctx.fillRect(0, h*0.75, w, h*0.12);
   ctx.fillStyle = '#f1c40f';
   const offset = (performance.now() / 25) % 80;
-  for (let x = -80 + offset; x < w; x += 80) {
-    ctx.fillRect(x, h*0.805, 40, 4);
-  }
+  for (let x = -80 + offset; x < w; x += 80) ctx.fillRect(x, h*0.805, 40, 4);
 
   ctx.save();
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   ctx.font = 'bold ' + Math.min(72, w*0.15) + 'px Arial';
   ctx.fillStyle = 'rgba(0,0,0,0.6)';
   ctx.fillText('3D ГОРОД', w/2 + 3, h*0.13 + 3);
   const gradT = ctx.createLinearGradient(0, h*0.08, 0, h*0.18);
-  gradT.addColorStop(0, '#ffcc00');
-  gradT.addColorStop(1, '#e63946');
+  gradT.addColorStop(0, '#ffcc00'); gradT.addColorStop(1, '#e63946');
   ctx.fillStyle = gradT;
   ctx.fillText('3D ГОРОД', w/2, h*0.13);
   ctx.strokeStyle = '#000'; ctx.lineWidth = 3;
   ctx.strokeText('3D ГОРОД', w/2, h*0.13);
   ctx.font = 'bold 18px Arial';
   ctx.fillStyle = 'rgba(255,255,255,0.7)';
-  ctx.fillText('езди и наслаждайся', w/2, h*0.19);
+  ctx.fillText('большой город — 120×120 м', w/2, h*0.19);
   ctx.restore();
 
   drawButtons();
@@ -872,7 +1100,7 @@ function drawMenu() {
   ctx.fillStyle = 'rgba(255,255,255,0.6)';
   ctx.font = 'bold 15px Arial';
   ctx.textAlign = 'center';
-  ctx.fillText('🏆 Рекорд скорости: ' + Math.round(records.bestSpeed * 3.6) + ' км/ч', w/2, h - 20);
+  ctx.fillText('🏆 Рекорд: ' + Math.round(records.bestSpeed * 3.6) + ' км/ч', w/2, h - 20);
 }
 
 function drawButtons() {
@@ -906,7 +1134,6 @@ function lighten(hex, amt) {
   const b = Math.min(255, parseInt(c.substr(4,2),16) + amt);
   return '#' + r.toString(16).padStart(2,'0') + g.toString(16).padStart(2,'0') + b.toString(16).padStart(2,'0');
 }
-
 function darken(hex, amt) {
   const c = hex.replace('#','');
   const r = Math.max(0, parseInt(c.substr(0,2),16) - amt);
@@ -988,8 +1215,9 @@ function drawControls() {
   ctx.fillText('📱 На телефоне:', x2, y0);
   ctx.fillStyle = '#fff'; ctx.font = '20px Arial';
   ctx.fillText('Джойстик слева — ехать', x2, y0 + lineH * 1.2);
-  ctx.fillText('Кнопка 📣 — гудок', x2, y0 + lineH * 2.0);
-  ctx.fillText('Кнопка ⏸ — пауза', x2, y0 + lineH * 2.8);
+  ctx.fillText('Кнопки →← ↑↓ справа', x2, y0 + lineH * 2.0);
+  ctx.fillText('Кнопка 📣 — гудок', x2, y0 + lineH * 2.8);
+  ctx.fillText('Монетки 🪙 — собирай!', x2, y0 + lineH * 3.6);
 
   drawButtons();
 }
@@ -1020,23 +1248,19 @@ function drawRecords() {
   ctx.fillStyle = '#ffcc00'; ctx.textAlign = 'right';
   ctx.fillText(Math.round(records.bestSpeed * 3.6) + ' км/ч', w*0.8, y);
   y += 45; ctx.textAlign = 'left';
-
   ctx.fillStyle = '#fff'; ctx.fillText('Лучшее время:', x, y);
   ctx.fillStyle = '#ffcc00'; ctx.textAlign = 'right';
   const bt = records.bestTime || 0;
   ctx.fillText(Math.floor(bt/60) + ':' + String(Math.floor(bt%60)).padStart(2,'0'), w*0.8, y);
   y += 45; ctx.textAlign = 'left';
-
   ctx.fillStyle = '#fff'; ctx.fillText('Дистанция:', x, y);
   ctx.fillStyle = '#ffcc00'; ctx.textAlign = 'right';
   ctx.fillText(Math.round(records.bestDistance) + ' м', w*0.8, y);
   y += 60; ctx.textAlign = 'left';
-
   ctx.fillStyle = '#fff'; ctx.font = 'bold 24px Arial';
   ctx.fillText('Лучшие заезды:', x, y);
   y += 40;
   ctx.font = '20px Arial';
-
   if (!records.topScores || records.topScores.length === 0) {
     ctx.fillStyle = 'rgba(255,255,255,0.5)';
     ctx.fillText('Пока нет — играй!', x, y);
@@ -1048,15 +1272,13 @@ function drawRecords() {
       y += 30;
     });
   }
-
   drawButtons();
 }
 
 function drawMenuBg() {
   const w = uiCanvas.width, h = uiCanvas.height;
   const grad = ctx.createLinearGradient(0, 0, 0, h);
-  grad.addColorStop(0, '#1e3c72');
-  grad.addColorStop(1, '#2a5298');
+  grad.addColorStop(0, '#1e3c72'); grad.addColorStop(1, '#2a5298');
   ctx.fillStyle = grad;
   ctx.fillRect(0, 0, w, h);
   ctx.fillStyle = 'rgba(0,0,0,0.5)';
@@ -1095,7 +1317,6 @@ function layoutGameOver() {
   const bw = Math.min(280, w * 0.45);
   const bh = 50;
   const cx = w / 2;
-
   makeButton('restart', '🔄  ЕЩЁ РАЗ', cx, h * 0.75, bw, bh, '#06d6a0', () => { clickSound(); startGame(); });
   makeButton('menu', '🏠  В МЕНЮ', cx, h * 0.75 + bh + 12, bw, bh, '#457b9d', () => { clickSound(); state = 'menu'; layoutMenu(); });
 }
@@ -1103,7 +1324,6 @@ function layoutGameOver() {
 function drawGameOver() {
   ctx.fillStyle = 'rgba(0,0,0,0.8)';
   ctx.fillRect(0, 0, uiCanvas.width, uiCanvas.height);
-
   const w = uiCanvas.width, h = uiCanvas.height;
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
 
@@ -1111,32 +1331,27 @@ function drawGameOver() {
   ctx.fillStyle = '#000';
   ctx.fillText('ЗАЕЗД ОКОНЧЕН', w/2 + 3, h*0.15 + 3);
   const grad = ctx.createLinearGradient(0, h*0.07, 0, h*0.18);
-  grad.addColorStop(0, '#ffcc00');
-  grad.addColorStop(1, '#e63946');
+  grad.addColorStop(0, '#ffcc00'); grad.addColorStop(1, '#e63946');
   ctx.fillStyle = grad;
   ctx.fillText('ЗАЕЗД ОКОНЧЕН', w/2, h*0.15);
 
   ctx.font = 'bold 22px Arial';
   const x = w * 0.25;
   let y = h * 0.28;
-
   ctx.fillStyle = '#fff'; ctx.textAlign = 'left';
   ctx.fillText('⏱  Время:', x, y);
   ctx.fillStyle = '#ffcc00'; ctx.textAlign = 'right';
   ctx.fillText(Math.floor(gameTime/60) + ':' + String(Math.floor(gameTime%60)).padStart(2,'0'), w*0.75, y);
   y += 35;
-
   ctx.fillStyle = '#fff'; ctx.textAlign = 'left';
   ctx.fillText('💨 Макс. скорость:', x, y);
   ctx.fillStyle = '#ffcc00'; ctx.textAlign = 'right';
   ctx.fillText(Math.round(maxSpeedReached * 3.6) + ' км/ч', w*0.75, y);
   y += 35;
-
   ctx.fillStyle = '#fff'; ctx.textAlign = 'left';
   ctx.fillText('📏 Дистанция:', x, y);
   ctx.fillStyle = '#ffcc00'; ctx.textAlign = 'right';
   ctx.fillText(Math.round(distanceDriven) + ' м', w*0.75, y);
-  y += 50;
 
   let newRecord = false;
   if (maxSpeedReached > records.bestSpeed) { records.bestSpeed = maxSpeedReached; newRecord = true; }
@@ -1157,7 +1372,6 @@ function drawGameOver() {
     ctx.fillText('✨ НОВЫЙ РЕКОРД! ✨', w/2, h*0.62);
     ctx.globalAlpha = 1;
   }
-
   drawButtons();
 }
 
@@ -1185,11 +1399,19 @@ function initUI() {
     const my = e.clientY - r.top;
     const b = getBtnAt(mx, my);
     if (b) b.onClick();
-    if (state === 'playing' && Math.hypot(mx - honkBtn.x, my - honkBtn.y) < honkBtn.r) {
-      honk(); honkBtn.active = true;
+    if (state === 'playing') {
+      if (Math.hypot(mx - honkBtn.x, my - honkBtn.y) < honkBtn.r) { honk(); honkBtn.active = true; }
+      if (Math.hypot(mx - btnUp.x, my - btnUp.y) < btnUp.r) btnUp.pressed = true;
+      if (Math.hypot(mx - btnDown.x, my - btnDown.y) < btnDown.r) btnDown.pressed = true;
+      if (Math.hypot(mx - btnLeft.x, my - btnLeft.y) < btnLeft.r) btnLeft.pressed = true;
+      if (Math.hypot(mx - btnRight.x, my - btnRight.y) < btnRight.r) btnRight.pressed = true;
     }
   });
-  uiCanvas.addEventListener('mouseup', () => { honkBtn.active = false; });
+  uiCanvas.addEventListener('mouseup', () => {
+    honkBtn.active = false;
+    btnUp.pressed = false; btnDown.pressed = false;
+    btnLeft.pressed = false; btnRight.pressed = false;
+  });
 
   uiCanvas.addEventListener('touchstart', onTouchStart, { passive: false });
   uiCanvas.addEventListener('touchmove', onTouchMove, { passive: false });
@@ -1210,20 +1432,34 @@ function initUI() {
   });
 }
 
+// Джойстик + кнопки-стрелки + гудок + пауза
 const joystick = {
   active: false, id: null,
   baseX: 0, baseY: 0, knobX: 0, knobY: 0,
   maxRadius: 70, dx: 0, dy: 0, visible: false,
 };
 
-const honkBtn = { x: 0, y: 0, r: 35, active: false };
+const honkBtn = { x: 0, y: 0, r: 30, active: false };
 const pauseBtn = { x: 0, y: 0, r: 28, active: false };
+const btnUp    = { x: 0, y: 0, r: 38, pressed: false, id: null };
+const btnDown  = { x: 0, y: 0, r: 38, pressed: false, id: null };
+const btnLeft  = { x: 0, y: 0, r: 38, pressed: false, id: null };
+const btnRight = { x: 0, y: 0, r: 38, pressed: false, id: null };
 
 function updateHonkBtnPos() {
-  honkBtn.x = innerWidth - 60;
-  honkBtn.y = innerHeight - 60;
-  pauseBtn.x = innerWidth - 60;
-  pauseBtn.y = 60;
+  honkBtn.x = innerWidth - 40;
+  honkBtn.y = 40;
+  pauseBtn.x = innerWidth - 40;
+  pauseBtn.y = innerHeight - 40;
+
+  // Кнопки-стрелки справа снизу
+  const cx = innerWidth - 110;
+  const cy = innerHeight - 110;
+  const r = 38;
+  btnUp.x = cx;      btnUp.y = cy - r*1.4;
+  btnDown.x = cx;    btnDown.y = cy + r*1.4;
+  btnLeft.x = cx - r*1.4; btnLeft.y = cy;
+  btnRight.x = cx + r*1.4; btnRight.y = cy;
 }
 
 function onTouchStart(e) {
@@ -1237,21 +1473,39 @@ function onTouchStart(e) {
     }
 
     if (state === 'playing') {
+      // Гудок
       if (Math.hypot(mx - honkBtn.x, my - honkBtn.y) < honkBtn.r + 10) {
         honk(); honkBtn.active = true;
         e.preventDefault(); continue;
       }
+      // Пауза
       if (Math.hypot(mx - pauseBtn.x, my - pauseBtn.y) < pauseBtn.r + 10) {
         state = 'paused'; layoutPause();
         e.preventDefault(); continue;
       }
-      if (!joystick.active) {
+      // Кнопки-стрелки
+      if (Math.hypot(mx - btnUp.x, my - btnUp.y) < btnUp.r + 10) {
+        btnUp.pressed = true; btnUp.id = t.identifier;
+        e.preventDefault(); continue;
+      }
+      if (Math.hypot(mx - btnDown.x, my - btnDown.y) < btnDown.r + 10) {
+        btnDown.pressed = true; btnDown.id = t.identifier;
+        e.preventDefault(); continue;
+      }
+      if (Math.hypot(mx - btnLeft.x, my - btnLeft.y) < btnLeft.r + 10) {
+        btnLeft.pressed = true; btnLeft.id = t.identifier;
+        e.preventDefault(); continue;
+      }
+      if (Math.hypot(mx - btnRight.x, my - btnRight.y) < btnRight.r + 10) {
+        btnRight.pressed = true; btnRight.id = t.identifier;
+        e.preventDefault(); continue;
+      }
+      // Джойстик (левая половина экрана)
+      if (mx < innerWidth * 0.55 && !joystick.active) {
         joystick.active = true;
         joystick.id = t.identifier;
-        joystick.baseX = mx;
-        joystick.baseY = my;
-        joystick.knobX = mx;
-        joystick.knobY = my;
+        joystick.baseX = mx; joystick.baseY = my;
+        joystick.knobX = mx; joystick.knobY = my;
         joystick.visible = true;
         e.preventDefault();
       }
@@ -1260,9 +1514,8 @@ function onTouchStart(e) {
 }
 
 function onTouchMove(e) {
-  if (!joystick.active) return;
   for (const t of e.changedTouches) {
-    if (t.identifier === joystick.id) {
+    if (joystick.active && t.identifier === joystick.id) {
       let dx = t.clientX - joystick.baseX;
       let dy = t.clientY - joystick.baseY;
       const d = Math.hypot(dx, dy);
@@ -1277,20 +1530,37 @@ function onTouchMove(e) {
 }
 
 function onTouchEnd(e) {
-  if (!joystick.active) { honkBtn.active = false; return; }
   for (const t of e.changedTouches) {
-    if (t.identifier === joystick.id) {
+    if (joystick.active && t.identifier === joystick.id) {
       joystick.active = false; joystick.id = null;
       joystick.dx = 0; joystick.dy = 0; joystick.visible = false;
     }
+    if (t.identifier === btnUp.id)    { btnUp.pressed = false;    btnUp.id = null; }
+    if (t.identifier === btnDown.id)  { btnDown.pressed = false;  btnDown.id = null; }
+    if (t.identifier === btnLeft.id)  { btnLeft.pressed = false;  btnLeft.id = null; }
+    if (t.identifier === btnRight.id) { btnRight.pressed = false; btnRight.id = null; }
   }
   honkBtn.active = false;
+}
+
+function drawCircleBtn(btn, symbol, color, symbolColor) {
+  uiCtx.globalAlpha = btn.pressed ? 0.95 : 0.7;
+  uiCtx.fillStyle = color;
+  uiCtx.beginPath(); uiCtx.arc(btn.x, btn.y, btn.r, 0, Math.PI*2); uiCtx.fill();
+  uiCtx.strokeStyle = '#fff'; uiCtx.lineWidth = 3;
+  uiCtx.beginPath(); uiCtx.arc(btn.x, btn.y, btn.r, 0, Math.PI*2); uiCtx.stroke();
+  uiCtx.globalAlpha = 1;
+  uiCtx.fillStyle = symbolColor || '#fff';
+  uiCtx.font = 'bold 32px Arial';
+  uiCtx.textAlign = 'center'; uiCtx.textBaseline = 'middle';
+  uiCtx.fillText(symbol, btn.x, btn.y + 2);
 }
 
 function drawGameUI() {
   uiCtx.clearRect(0, 0, uiCanvas.width, uiCanvas.height);
   if (state !== 'playing' && state !== 'paused') return;
 
+  // Джойстик слева
   if (joystick.active && joystick.visible) {
     uiCtx.globalAlpha = 0.35;
     uiCtx.fillStyle = '#000';
@@ -1305,7 +1575,7 @@ function drawGameUI() {
     uiCtx.strokeStyle = '#fff'; uiCtx.lineWidth = 2; uiCtx.stroke();
     uiCtx.globalAlpha = 1;
   } else if (IS_MOBILE) {
-    const hx = innerWidth * 0.25, hy = innerHeight * 0.78, r = joystick.maxRadius;
+    const hx = innerWidth * 0.22, hy = innerHeight * 0.75, r = joystick.maxRadius;
     uiCtx.globalAlpha = 0.22;
     uiCtx.strokeStyle = '#fff'; uiCtx.lineWidth = 3;
     uiCtx.beginPath(); uiCtx.arc(hx, hy, r, 0, Math.PI*2); uiCtx.stroke();
@@ -1316,16 +1586,24 @@ function drawGameUI() {
     uiCtx.globalAlpha = 1;
   }
 
+  // 4 кнопки-стрелки справа
+  drawCircleBtn(btnUp,    '▲', '#457b9d');
+  drawCircleBtn(btnDown,  '▼', '#457b9d');
+  drawCircleBtn(btnLeft,  '◀', '#2a9d8f');
+  drawCircleBtn(btnRight, '▶', '#2a9d8f');
+
+  // Гудок
   uiCtx.globalAlpha = honkBtn.active ? 0.9 : 0.6;
   uiCtx.fillStyle = honkBtn.active ? '#ffcc00' : '#000';
   uiCtx.beginPath(); uiCtx.arc(honkBtn.x, honkBtn.y, honkBtn.r, 0, Math.PI*2); uiCtx.fill();
   uiCtx.strokeStyle = '#fff'; uiCtx.lineWidth = 2; uiCtx.stroke();
   uiCtx.globalAlpha = 1;
   uiCtx.fillStyle = honkBtn.active ? '#000' : '#fff';
-  uiCtx.font = 'bold 22px Arial';
+  uiCtx.font = 'bold 20px Arial';
   uiCtx.textAlign = 'center'; uiCtx.textBaseline = 'middle';
   uiCtx.fillText('📣', honkBtn.x, honkBtn.y + 1);
 
+  // Пауза
   uiCtx.globalAlpha = 0.6;
   uiCtx.fillStyle = '#000';
   uiCtx.beginPath(); uiCtx.arc(pauseBtn.x, pauseBtn.y, pauseBtn.r, 0, Math.PI*2); uiCtx.fill();
@@ -1335,14 +1613,16 @@ function drawGameUI() {
   uiCtx.fillRect(pauseBtn.x - 7, pauseBtn.y - 9, 4, 18);
   uiCtx.fillRect(pauseBtn.x + 3, pauseBtn.y - 9, 4, 18);
 
+  // Таймер + монеты
   const timeStr = Math.floor(gameTime/60) + ':' + String(Math.floor(gameTime%60)).padStart(2,'0');
   uiCtx.fillStyle = 'rgba(0,0,0,0.6)';
-  roundRect(uiCtx, uiCanvas.width/2 - 60, 15, 120, 40, 10);
+  roundRect(uiCtx, uiCanvas.width/2 - 80, 15, 160, 40, 10);
   uiCtx.fill();
   uiCtx.fillStyle = '#fff';
-  uiCtx.font = 'bold 24px Arial';
+  uiCtx.font = 'bold 22px Arial';
   uiCtx.textAlign = 'center'; uiCtx.textBaseline = 'middle';
-  uiCtx.fillText(timeStr, uiCanvas.width/2, 35);
+  const coinsCollected = pickupItems.filter(p => !p.alive).length;
+  uiCtx.fillText('⏱ ' + timeStr + '  🪙 ' + coinsCollected + '/' + pickupItems.length, uiCanvas.width/2, 35);
 }
 
 function roundRect(g, x, y, w, h, r) {
@@ -1390,9 +1670,9 @@ function animate() {
   } else {
     if (camera && carGroup) {
       const t = now / 3000;
-      camera.position.x = Math.sin(t) * 25;
-      camera.position.z = Math.cos(t) * 25;
-      camera.position.y = 12;
+      camera.position.x = Math.sin(t) * 35;
+      camera.position.z = Math.cos(t) * 35;
+      camera.position.y = 15;
       camera.lookAt(0, 1, 0);
     }
   }
